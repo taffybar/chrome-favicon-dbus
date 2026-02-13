@@ -35,7 +35,7 @@ Chrome extension contexts can do outbound localhost `fetch`, but cannot host a l
 Build standard Linux package:
 
 ```bash
-cd ~/Projects/chrome-window-icons
+cd ~/Projects/chrome-favicon-bridge
 nix build .#chrome-window-dbus-bridge
 ```
 
@@ -48,35 +48,35 @@ Run the built binary:
 Build static Linux package (musl):
 
 ```bash
-cd ~/Projects/chrome-window-icons
+cd ~/Projects/chrome-favicon-bridge
 nix build .#chrome-window-dbus-bridge-static
 ```
 
 Run without building explicitly:
 
 ```bash
-cd ~/Projects/chrome-window-icons
+cd ~/Projects/chrome-favicon-bridge
 nix run .#chrome-window-dbus-bridge -- --host 127.0.0.1 --port 38933 --path /update
 ```
 
 Install in profile:
 
 ```bash
-cd ~/Projects/chrome-window-icons
+cd ~/Projects/chrome-favicon-bridge
 nix profile install .#chrome-window-dbus-bridge
 ```
 
 ## Alternative non-Nix build
 
 ```bash
-cd ~/Projects/chrome-window-icons
+cd ~/Projects/chrome-favicon-bridge
 cargo install --path bridge-rs --locked
 ```
 
 ## Load extension
 
 ```text
-Chrome -> chrome://extensions -> Developer mode -> Load unpacked -> ~/Projects/chrome-window-icons/extension
+Chrome -> chrome://extensions -> Developer mode -> Load unpacked -> ~/Projects/chrome-favicon-bridge/extension
 ```
 
 ## Monitor D-Bus updates
@@ -114,7 +114,7 @@ Useful fields from signal payload:
 
 ```bash
 mkdir -p ~/.config/systemd/user
-cp ~/Projects/chrome-window-icons/systemd/chrome-window-info-bridge.service ~/.config/systemd/user/
+cp ~/Projects/chrome-favicon-bridge/systemd/chrome-window-info-bridge.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now chrome-window-info-bridge.service
 ```
