@@ -1,30 +1,28 @@
 const BRIDGE_URL = "http://127.0.0.1:38933/update";
+const FETCH_TIMEOUT_MS = 2000;
 
 let pendingReason = null;
-let pendingWindowHint = null;
 let flushInFlight = false;
-let lastPayloadFingerprint = "";
+const lastPayloadFingerprints = new Map();
+
+function chromeCall(apiFunction, ...args) {
+  return new Promise((resolve, reject) => {
+    apiFunction(...args, (result) => {
+      const error = chrome.runtime.lastError;
+      if (error) {
+        reject(new Error(error.message));
+      } else {
+        resolve(result);
+      }
+    });
+  });
+}
 
 function stableFingerprint(payload) {
   return JSON.stringify(payload);
 }
 
-async function getActiveTabSnapshot(windowIdHint = null) {
-  const query = { active: true };
-
-  if (windowIdHint !== null && windowIdHint !== chrome.windows.WINDOW_ID_NONE) {
-    query.windowId = windowIdHint;
-  } else {
-    query.lastFocusedWindow = true;
-  }
-
-  const [tab] = await chrome.tabs.query(query);
-  if (!tab) {
-    return null;
-  }
-
-  const chromeWindow = await chrome.windows.get(tab.windowId);
-
+function snapshotFromTabAndWindow(tab, chromeWindow) {
   return {
     tab: {
       id: tab.id,
@@ -51,12 +49,30 @@ async function getActiveTabSnapshot(windowIdHint = null) {
   };
 }
 
-async function pushSnapshot(reason, windowIdHint = null) {
-  const snapshot = await getActiveTabSnapshot(windowIdHint);
-  if (!snapshot) {
-    return;
+async function getActiveTabSnapshot(windowIdHint = null) {
+  const query = { active: true };
+
+  if (windowIdHint !== null && windowIdHint !== chrome.windows.WINDOW_ID_NONE) {
+    query.windowId = windowIdHint;
+  } else {
+    query.lastFocusedWindow = true;
   }
 
+  const [tab] = await chromeCall((queryInfo, callback) => {
+    chrome.tabs.query(queryInfo, callback);
+  }, query);
+  if (!tab) {
+    return null;
+  }
+
+  const chromeWindow = await chromeCall((windowId, callback) => {
+    chrome.windows.get(windowId, callback);
+  }, tab.windowId);
+
+  return snapshotFromTabAndWindow(tab, chromeWindow);
+}
+
+async function pushSnapshotPayload(reason, snapshot) {
   const payload = {
     schema: "org.imalison.chrome_window_info.v1",
     event_reason: reason,
@@ -65,23 +81,60 @@ async function pushSnapshot(reason, windowIdHint = null) {
   };
 
   const fingerprint = stableFingerprint(snapshot);
-  if (fingerprint === lastPayloadFingerprint && reason !== "window-focus-changed") {
+  const fingerprintKey = String(snapshot.chrome_window.id);
+  if (
+    fingerprint === lastPayloadFingerprints.get(fingerprintKey) &&
+    reason !== "window-focus-changed"
+  ) {
     return;
   }
 
-  lastPayloadFingerprint = fingerprint;
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
 
   try {
-    await fetch(BRIDGE_URL, {
+    const response = await fetch(BRIDGE_URL, {
       method: "POST",
       headers: {
         "Content-Type": "application/json"
       },
       body: JSON.stringify(payload),
-      keepalive: true
+      keepalive: true,
+      signal: controller.signal
     });
-  } catch (_error) {
-    // The bridge daemon is optional and may not be running.
+
+    if (!response.ok) {
+      throw new Error(`Bridge returned HTTP ${response.status}`);
+    }
+
+    lastPayloadFingerprints.set(fingerprintKey, fingerprint);
+  } catch (error) {
+    console.warn("Failed to publish Chrome window snapshot", error);
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+async function pushSnapshot(reason, windowIdHint = null) {
+  const snapshot = await getActiveTabSnapshot(windowIdHint);
+  if (snapshot) {
+    await pushSnapshotPayload(reason, snapshot);
+  }
+}
+
+async function pushAllWindowSnapshots(reason) {
+  const windows = await chromeCall((getInfo, callback) => {
+    chrome.windows.getAll(getInfo, callback);
+  }, {
+    populate: true,
+    windowTypes: ["normal"]
+  });
+
+  for (const chromeWindow of windows) {
+    const tab = chromeWindow.tabs?.find((candidate) => candidate.active);
+    if (tab) {
+      await pushSnapshotPayload(reason, snapshotFromTabAndWindow(tab, chromeWindow));
+    }
   }
 }
 
@@ -92,21 +145,24 @@ async function flushPendingPushes() {
 
   flushInFlight = true;
 
-  while (pendingReason !== null) {
-    const reasonToSend = pendingReason;
-    const hintToSend = pendingWindowHint;
-    pendingReason = null;
-    pendingWindowHint = null;
+  try {
+    while (pendingReason !== null) {
+      const reasonToSend = pendingReason;
+      pendingReason = null;
 
-    await pushSnapshot(reasonToSend, hintToSend);
+      try {
+        await pushAllWindowSnapshots(reasonToSend);
+      } catch (error) {
+        console.warn("Failed to push Chrome window snapshots", error);
+      }
+    }
+  } finally {
+    flushInFlight = false;
   }
-
-  flushInFlight = false;
 }
 
-function schedulePush(reason, windowIdHint = null) {
+function schedulePush(reason) {
   pendingReason = reason;
-  pendingWindowHint = windowIdHint;
   void flushPendingPushes();
 }
 
@@ -140,3 +196,12 @@ chrome.runtime.onInstalled.addListener(() => {
 chrome.runtime.onStartup.addListener(() => {
   schedulePush("runtime-startup");
 });
+
+globalThis.chromeFaviconBridgeDebug = {
+  pushAll: (reason = "manual-debug") => pushAllWindowSnapshots(reason),
+  state: () => ({
+    flushInFlight,
+    pendingReason,
+    lastPayloadFingerprints: Object.fromEntries(lastPayloadFingerprints)
+  })
+};

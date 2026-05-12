@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::env;
+use std::fs;
 use std::net::SocketAddr;
+use std::os::unix::fs::FileTypeExt;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
@@ -56,6 +58,7 @@ struct AppState {
 struct SharedDbusState {
     schema: String,
     last_payload: Arc<RwLock<String>>,
+    window_payloads: Arc<RwLock<HashMap<String, Value>>>,
 }
 
 struct ChromeWindowInfoInterface {
@@ -68,12 +71,24 @@ impl ChromeWindowInfoInterface {
         self.shared.last_payload.read().await.clone()
     }
 
+    async fn get_window_payloads(&self) -> String {
+        serde_json::to_string(&*self.shared.window_payloads.read().await)
+            .unwrap_or_else(|_| "{}".to_owned())
+    }
+
     async fn get_schema(&self) -> String {
         self.shared.schema.clone()
     }
 
     #[zbus(signal)]
     async fn updated(ctxt: &SignalContext<'_>, payload: &str) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    async fn window_updated(
+        ctxt: &SignalContext<'_>,
+        window_id: &str,
+        payload: &str,
+    ) -> zbus::Result<()>;
 }
 
 type SharedHyprlandState = Arc<RwLock<HyprlandState>>;
@@ -253,6 +268,16 @@ async fn process_payloads(
             *guard = payload_text.clone();
         }
 
+        let mapped_window_id = enriched
+            .pointer("/bridge/mapped_window/window_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+
+        if let Some(window_id) = mapped_window_id.as_deref() {
+            let mut guard = shared.window_payloads.write().await;
+            guard.insert(window_id.to_owned(), enriched.clone());
+        }
+
         let ctxt = match SignalContext::new(&connection, object_path.as_str()) {
             Ok(v) => v,
             Err(err) => {
@@ -260,6 +285,14 @@ async fn process_payloads(
                 continue;
             }
         };
+
+        if let Some(window_id) = mapped_window_id.as_deref() {
+            if let Err(err) =
+                ChromeWindowInfoInterface::window_updated(&ctxt, window_id, &payload_text).await
+            {
+                error!("failed to emit WindowUpdated signal: {err}");
+            }
+        }
 
         if let Err(err) = ChromeWindowInfoInterface::updated(&ctxt, &payload_text).await {
             error!("failed to emit Updated signal: {err}");
@@ -391,9 +424,9 @@ async fn refresh_hyprland_state(shared: &SharedHyprlandState) {
     }
 
     let checked_at = utc_now_iso();
-    let active = run_json_command("hyprctl", &["-j", "activewindow"])
-        .and_then(|value| hypr_client_from_value(&value));
-    let clients = run_json_command("hyprctl", &["-j", "clients"]).and_then(|value| {
+    let active =
+        run_hyprctl_json(&["-j", "activewindow"]).and_then(|value| hypr_client_from_value(&value));
+    let clients = run_hyprctl_json(&["-j", "clients"]).and_then(|value| {
         value.as_array().map(|clients| {
             clients
                 .iter()
@@ -519,13 +552,41 @@ async fn apply_hyprland_event(shared: &SharedHyprlandState, line: &str) {
 
 fn hyprland_socket2_path() -> Option<PathBuf> {
     let runtime_dir = env::var_os("XDG_RUNTIME_DIR")?;
-    let signature = env::var_os("HYPRLAND_INSTANCE_SIGNATURE")?;
+    let signature = hyprland_instance_signature()?;
     Some(
         PathBuf::from(runtime_dir)
             .join("hypr")
             .join(signature)
             .join(".socket2.sock"),
     )
+}
+
+fn hyprland_instance_signature() -> Option<String> {
+    env::var("HYPRLAND_INSTANCE_SIGNATURE")
+        .ok()
+        .filter(|signature| !signature.is_empty())
+        .or_else(|| {
+            let runtime_dir = env::var_os("XDG_RUNTIME_DIR")?;
+            let hypr_dir = PathBuf::from(runtime_dir).join("hypr");
+            fs::read_dir(hypr_dir)
+                .ok()?
+                .filter_map(Result::ok)
+                .find_map(|entry| {
+                    if path_is_socket(entry.path().join(".socket.sock"))
+                        || path_is_socket(entry.path().join(".socket2.sock"))
+                    {
+                        entry.file_name().into_string().ok()
+                    } else {
+                        None
+                    }
+                })
+        })
+}
+
+fn path_is_socket(path: PathBuf) -> bool {
+    fs::metadata(path)
+        .map(|metadata| metadata.file_type().is_socket())
+        .unwrap_or(false)
 }
 
 fn hypr_client_from_value(value: &Value) -> Option<HyprClient> {
@@ -617,10 +678,10 @@ fn score_hyprland_candidates(
 
             let title_score = title_similarity(tab_title, &client.title);
             if title_score >= 0.9 {
-                confidence += 0.25;
+                confidence += 0.55;
                 sources.push("exact_or_contained_title".to_owned());
             } else if title_score >= 0.5 {
-                confidence += 0.15;
+                confidence += 0.25;
                 sources.push("partial_title".to_owned());
             }
 
@@ -818,9 +879,20 @@ fn run_text_command(command: &str, args: &[&str]) -> Option<String> {
     }
 }
 
-fn run_json_command(command: &str, args: &[&str]) -> Option<Value> {
-    let text = run_text_command(command, args)?;
-    serde_json::from_str::<Value>(&text).ok()
+fn run_hyprctl_json(args: &[&str]) -> Option<Value> {
+    let mut command = Command::new("hyprctl");
+    if env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_none() {
+        if let Some(signature) = hyprland_instance_signature() {
+            command.arg("-i").arg(signature);
+        }
+    }
+    let output = command.args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let text = String::from_utf8(output.stdout).ok()?;
+    serde_json::from_str::<Value>(text.trim()).ok()
 }
 
 fn looks_like_chrome(class_name: &str) -> bool {
@@ -875,6 +947,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let shared = SharedDbusState {
         schema: DEFAULT_SCHEMA.to_owned(),
         last_payload: Arc::new(RwLock::new("{}".to_owned())),
+        window_payloads: Arc::new(RwLock::new(HashMap::new())),
     };
     let hyprland = Arc::new(RwLock::new(HyprlandState::default()));
 
