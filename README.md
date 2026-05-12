@@ -9,10 +9,11 @@ The extension sends JSON to a local HTTP endpoint, and a Rust daemon re-publishe
 - Chrome extension emits active tab + Chrome window metadata.
 - Rust daemon exposes updates over D-Bus signal: `org.imalison.ChromeWindowInfo.Updated`.
 - Payload enrichment includes:
-  - Hyprland active window (`hyprctl -j activewindow`)
-  - Hyprland title matches (`hyprctl -j clients`)
+  - Hyprland active window and client list (`hyprctl -j activewindow`, `hyprctl -j clients`)
+  - Hyprland IPC event state from `.socket2.sock` when available
+  - Scored Hyprland candidate windows using focus, title, geometry, and cached continuity
   - X11 active window via `xdotool` when available
-- Cached mapping from Chrome `window_id` -> Hyprland window address.
+- Cached mapping from Chrome `window_id` -> Hyprland window address with confidence/source metadata.
 
 ## Layout
 
@@ -79,12 +80,20 @@ cargo install --path bridge-rs --locked
 Chrome -> chrome://extensions -> Developer mode -> Load unpacked -> ~/Projects/chrome-favicon-bridge/extension
 ```
 
+Note: Recent Google Chrome builds (including 145.x) reject command-line extension loading flags (`--load-extension`, `--disable-extensions-except`). Use `chrome://extensions` developer mode for unpacked installs.
+
 ## Monitor D-Bus updates
 
 ```bash
 gdbus monitor --session \
   --dest org.imalison.ChromeWindowInfo \
   --object-path /org/imalison/ChromeWindowInfo
+```
+
+Fallback if `gdbus` is unavailable:
+
+```bash
+dbus-monitor "type='signal',interface='org.imalison.ChromeWindowInfo',member='Updated'"
 ```
 
 Each `Updated` signal carries one JSON string payload.
@@ -105,9 +114,14 @@ Each `Updated` signal carries one JSON string payload.
 Useful fields from signal payload:
 
 - `chrome_window.id`: Chrome internal window id
-- `bridge.mapped_window.window_id`: Cached Hyprland address (when known)
+- `chrome_window.left` / `top` / `width` / `height`: Chrome window bounds used for Hyprland matching
+- `bridge.mapped_window.window_id`: Best Hyprland address (when known)
+- `bridge.mapped_window.confidence`: Score for the chosen mapping
+- `bridge.mapped_window.sources[]`: Signals that contributed to the chosen mapping
 - `wm.hyprland_active.address`: Current active Hyprland window address
-- `wm.hyprland_title_matches[]`: Candidate Hyprland windows matching tab title
+- `wm.hyprland_event_stream_connected`: Whether the daemon is connected to Hyprland's event socket
+- `wm.hyprland_candidates[]`: Top scored Hyprland windows considered for this Chrome update
+- `wm.hyprland_title_matches[]`: Hyprland windows with similar Chrome tab titles
 - `wm.x11_active.id_decimal` / `wm.x11_active.id_hex`: Active X11 window id
 
 ## Optional: user systemd service
