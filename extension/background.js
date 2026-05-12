@@ -1,9 +1,8 @@
 const BRIDGE_URL = "http://127.0.0.1:38933/update";
-const PUSH_DEBOUNCE_MS = 150;
 
-let scheduledPush = null;
-let pendingReason = "startup";
+let pendingReason = null;
 let pendingWindowHint = null;
+let flushInFlight = false;
 let lastPayloadFingerprint = "";
 
 function stableFingerprint(payload) {
@@ -43,7 +42,11 @@ async function getActiveTabSnapshot(windowIdHint = null) {
       id: chromeWindow.id,
       focused: Boolean(chromeWindow.focused),
       state: chromeWindow.state ?? "normal",
-      type: chromeWindow.type ?? "normal"
+      type: chromeWindow.type ?? "normal",
+      top: chromeWindow.top ?? null,
+      left: chromeWindow.left ?? null,
+      width: chromeWindow.width ?? null,
+      height: chromeWindow.height ?? null
     }
   };
 }
@@ -82,23 +85,29 @@ async function pushSnapshot(reason, windowIdHint = null) {
   }
 }
 
-function schedulePush(reason, windowIdHint = null) {
-  pendingReason = reason;
-  pendingWindowHint = windowIdHint;
-
-  if (scheduledPush !== null) {
+async function flushPendingPushes() {
+  if (flushInFlight) {
     return;
   }
 
-  scheduledPush = setTimeout(async () => {
+  flushInFlight = true;
+
+  while (pendingReason !== null) {
     const reasonToSend = pendingReason;
     const hintToSend = pendingWindowHint;
-    scheduledPush = null;
-    pendingReason = "event";
+    pendingReason = null;
     pendingWindowHint = null;
 
     await pushSnapshot(reasonToSend, hintToSend);
-  }, PUSH_DEBOUNCE_MS);
+  }
+
+  flushInFlight = false;
+}
+
+function schedulePush(reason, windowIdHint = null) {
+  pendingReason = reason;
+  pendingWindowHint = windowIdHint;
+  void flushPendingPushes();
 }
 
 chrome.tabs.onActivated.addListener(({ windowId }) => {
