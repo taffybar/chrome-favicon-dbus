@@ -1,5 +1,5 @@
 {
-  description = "Chrome tab metadata bridge (HTTP from extension -> D-Bus for WM consumers)";
+  description = "Chrome favicon metadata over D-Bus for WM consumers";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -24,7 +24,7 @@
 
           mkBridge = rustPlatform:
             rustPlatform.buildRustPackage {
-              pname = "chrome-window-dbus-bridge";
+              pname = "chrome-favicon-dbus";
               inherit version;
 
               src = self;
@@ -35,10 +35,10 @@
               };
 
               meta = with pkgs.lib; {
-                description = "HTTP ingest + D-Bus publisher for Chrome active tab metadata";
+                description = "HTTP ingest + D-Bus publisher for Chrome favicon metadata";
                 license = licenses.mit;
                 platforms = platforms.linux;
-                mainProgram = "chrome-window-dbus-bridge";
+                mainProgram = "chrome-favicon-dbus";
               };
             };
 
@@ -46,6 +46,8 @@
           bridgeStatic = mkBridge pkgs.pkgsStatic.rustPlatform;
         in
         {
+          chrome-favicon-dbus = bridge;
+          chrome-favicon-dbus-static = bridgeStatic;
           chrome-window-dbus-bridge = bridge;
           chrome-window-dbus-bridge-static = bridgeStatic;
           default = bridge;
@@ -53,17 +55,22 @@
 
       apps = forAllSystems (system:
         let
-          pkg = self.packages.${system}.chrome-window-dbus-bridge;
+          pkg = self.packages.${system}.chrome-favicon-dbus;
         in
         {
           default = {
             type = "app";
-            program = "${pkg}/bin/chrome-window-dbus-bridge";
+            program = "${pkg}/bin/chrome-favicon-dbus";
+          };
+
+          chrome-favicon-dbus = {
+            type = "app";
+            program = "${pkg}/bin/chrome-favicon-dbus";
           };
 
           chrome-window-dbus-bridge = {
             type = "app";
-            program = "${pkg}/bin/chrome-window-dbus-bridge";
+            program = "${pkg}/bin/chrome-favicon-dbus";
           };
         });
     };

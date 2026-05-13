@@ -1,0 +1,12 @@
+[Unit]
+Description=Chrome favicon metadata over D-Bus
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.nix-profile/bin/chrome-favicon-dbus --host 127.0.0.1 --port 38933 --path /update
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

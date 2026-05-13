@@ -1,8 +1,8 @@
-# Chrome Window Info Bridge
+# Chrome Favicon D-Bus
 
 Publish active Chrome tab metadata (title, URL, favicon) to D-Bus so Hyprland/Wayland/X11 tooling can consume it.
 
-The extension sends JSON to a local HTTP endpoint, and a Rust daemon re-publishes enriched updates on D-Bus.
+The extension sends JSON to a local HTTP endpoint, and a Rust daemon publishes enriched updates on D-Bus.
 
 ## What this gives you
 
@@ -19,9 +19,9 @@ The extension sends JSON to a local HTTP endpoint, and a Rust daemon re-publishe
 
 - `extension/manifest.json`: Manifest V3 extension
 - `extension/background.js`: Active-tab capture and localhost POST
-- `bridge-rs/Cargo.toml`: Rust bridge crate
-- `bridge-rs/src/main.rs`: HTTP -> D-Bus bridge daemon
-- `systemd/chrome-window-info-bridge.service`: Optional user service template
+- `bridge-rs/Cargo.toml`: Rust daemon crate
+- `bridge-rs/src/main.rs`: HTTP -> D-Bus daemon
+- `systemd/chrome-favicon-dbus.service`: Optional user service template
 
 ## Extension transport
 
@@ -36,48 +36,48 @@ Chrome extension contexts can do outbound localhost `fetch`, but cannot host a l
 Build standard Linux package:
 
 ```bash
-cd ~/Projects/chrome-favicon-bridge
-nix build .#chrome-window-dbus-bridge
+cd ~/Projects/chrome-favicon-dbus
+nix build .#chrome-favicon-dbus
 ```
 
 Run the built binary:
 
 ```bash
-./result/bin/chrome-window-dbus-bridge --host 127.0.0.1 --port 38933 --path /update
+./result/bin/chrome-favicon-dbus --host 127.0.0.1 --port 38933 --path /update
 ```
 
 Build static Linux package (musl):
 
 ```bash
-cd ~/Projects/chrome-favicon-bridge
-nix build .#chrome-window-dbus-bridge-static
+cd ~/Projects/chrome-favicon-dbus
+nix build .#chrome-favicon-dbus-static
 ```
 
 Run without building explicitly:
 
 ```bash
-cd ~/Projects/chrome-favicon-bridge
-nix run .#chrome-window-dbus-bridge -- --host 127.0.0.1 --port 38933 --path /update
+cd ~/Projects/chrome-favicon-dbus
+nix run .#chrome-favicon-dbus -- --host 127.0.0.1 --port 38933 --path /update
 ```
 
 Install in profile:
 
 ```bash
-cd ~/Projects/chrome-favicon-bridge
-nix profile install .#chrome-window-dbus-bridge
+cd ~/Projects/chrome-favicon-dbus
+nix profile install .#chrome-favicon-dbus
 ```
 
 ## Alternative non-Nix build
 
 ```bash
-cd ~/Projects/chrome-favicon-bridge
+cd ~/Projects/chrome-favicon-dbus
 cargo install --path bridge-rs --locked
 ```
 
 ## Load extension
 
 ```text
-Chrome -> chrome://extensions -> Developer mode -> Load unpacked -> ~/Projects/chrome-favicon-bridge/extension
+Chrome -> chrome://extensions -> Developer mode -> Load unpacked -> ~/Projects/chrome-favicon-dbus/extension
 ```
 
 Note: Recent Google Chrome builds (including 145.x) reject command-line extension loading flags (`--load-extension`, `--disable-extensions-except`). Use `chrome://extensions` developer mode for unpacked installs.
@@ -128,12 +128,12 @@ Useful fields from signal payload:
 
 ```bash
 mkdir -p ~/.config/systemd/user
-cp ~/Projects/chrome-favicon-bridge/systemd/chrome-window-info-bridge.service ~/.config/systemd/user/
+cp ~/Projects/chrome-favicon-dbus/systemd/chrome-favicon-dbus.service ~/.config/systemd/user/
 systemctl --user daemon-reload
-systemctl --user enable --now chrome-window-info-bridge.service
+systemctl --user enable --now chrome-favicon-dbus.service
 ```
 
-The provided unit uses `%h/.nix-profile/bin/chrome-window-dbus-bridge`. If you install with `cargo install` instead, update `ExecStart` accordingly.
+The provided unit uses `%h/.nix-profile/bin/chrome-favicon-dbus`. If you install with `cargo install` instead, update `ExecStart` accordingly.
 
 ## Notes
 

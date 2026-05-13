@@ -27,7 +27,7 @@ const DEFAULT_OBJECT_PATH: &str = "/org/imalison/ChromeWindowInfo";
 const DEFAULT_SCHEMA: &str = "org.imalison.chrome_window_info.v1";
 
 #[derive(Parser, Debug, Clone)]
-#[command(about = "Chrome metadata to D-Bus bridge")]
+#[command(about = "Chrome favicon metadata over D-Bus")]
 struct Args {
     #[arg(long, default_value = "127.0.0.1")]
     host: String,
