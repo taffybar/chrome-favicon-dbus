@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Chrome Favicon D-Bus",
   "description": "Publishes active tab metadata (title/url/favicon) to a local D-Bus daemon.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "minimum_chrome_version": "120",
   "permissions": ["tabs", "windows", "alarms"],
   "host_permissions": [
