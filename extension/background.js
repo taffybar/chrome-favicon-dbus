@@ -1,8 +1,22 @@
 const BRIDGE_URL = "http://127.0.0.1:38933/update";
 const FETCH_TIMEOUT_MS = 2000;
+const HEARTBEAT_ALARM = "bridge-heartbeat";
+const HEARTBEAT_PERIOD_MINUTES = 0.5;
+const INITIAL_RETRY_DELAY_MS = 1000;
+const MAX_RETRY_DELAY_MS = 30000;
+
+const FORCED_PUSH_REASONS = new Set([
+  "window-focus-changed",
+  "heartbeat",
+  "extension-installed",
+  "runtime-startup"
+]);
 
 let pendingReason = null;
+let pendingForced = false;
 let flushInFlight = false;
+let retryTimerId = null;
+let retryDelayMs = INITIAL_RETRY_DELAY_MS;
 const lastPayloadFingerprints = new Map();
 
 function chromeCall(apiFunction, ...args) {
@@ -49,45 +63,19 @@ function snapshotFromTabAndWindow(tab, chromeWindow) {
   };
 }
 
-async function getActiveTabSnapshot(windowIdHint = null) {
-  const query = { active: true };
-
-  if (windowIdHint !== null && windowIdHint !== chrome.windows.WINDOW_ID_NONE) {
-    query.windowId = windowIdHint;
-  } else {
-    query.lastFocusedWindow = true;
+async function pushSnapshotPayload(reason, snapshot, forced) {
+  const fingerprint = stableFingerprint(snapshot);
+  const fingerprintKey = String(snapshot.chrome_window.id);
+  if (!forced && fingerprint === lastPayloadFingerprints.get(fingerprintKey)) {
+    return true;
   }
 
-  const [tab] = await chromeCall((queryInfo, callback) => {
-    chrome.tabs.query(queryInfo, callback);
-  }, query);
-  if (!tab) {
-    return null;
-  }
-
-  const chromeWindow = await chromeCall((windowId, callback) => {
-    chrome.windows.get(windowId, callback);
-  }, tab.windowId);
-
-  return snapshotFromTabAndWindow(tab, chromeWindow);
-}
-
-async function pushSnapshotPayload(reason, snapshot) {
   const payload = {
     schema: "org.imalison.chrome_window_info.v1",
     event_reason: reason,
     event_time: new Date().toISOString(),
     ...snapshot
   };
-
-  const fingerprint = stableFingerprint(snapshot);
-  const fingerprintKey = String(snapshot.chrome_window.id);
-  if (
-    fingerprint === lastPayloadFingerprints.get(fingerprintKey) &&
-    reason !== "window-focus-changed"
-  ) {
-    return;
-  }
 
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
@@ -107,35 +95,60 @@ async function pushSnapshotPayload(reason, snapshot) {
       throw new Error(`Bridge returned HTTP ${response.status}`);
     }
 
-    lastPayloadFingerprints.set(fingerprintKey, fingerprint);
+    const result = await response.json().catch(() => ({}));
+    if (result.mapped === false && result.hyprland !== false) {
+      // The bridge has a Hyprland backend but could not map this window yet;
+      // leaving the fingerprint unset makes the next event or heartbeat retry.
+      lastPayloadFingerprints.delete(fingerprintKey);
+    } else {
+      lastPayloadFingerprints.set(fingerprintKey, fingerprint);
+    }
+    return true;
   } catch (error) {
+    // The bridge may have processed the request even though the response was
+    // lost, so the consumer's state is unknown; forget the fingerprint to
+    // force the next push through.
+    lastPayloadFingerprints.delete(fingerprintKey);
     console.warn("Failed to publish Chrome window snapshot", error);
+    return false;
   } finally {
     clearTimeout(timeoutId);
   }
 }
 
-async function pushSnapshot(reason, windowIdHint = null) {
-  const snapshot = await getActiveTabSnapshot(windowIdHint);
-  if (snapshot) {
-    await pushSnapshotPayload(reason, snapshot);
-  }
-}
-
-async function pushAllWindowSnapshots(reason) {
+async function pushAllWindowSnapshots(reason, forced = false) {
   const windows = await chromeCall((getInfo, callback) => {
     chrome.windows.getAll(getInfo, callback);
   }, {
     populate: true,
-    windowTypes: ["normal"]
+    windowTypes: ["normal", "popup", "app"]
   });
 
+  let allSucceeded = true;
   for (const chromeWindow of windows) {
     const tab = chromeWindow.tabs?.find((candidate) => candidate.active);
     if (tab) {
-      await pushSnapshotPayload(reason, snapshotFromTabAndWindow(tab, chromeWindow));
+      const succeeded = await pushSnapshotPayload(
+        reason,
+        snapshotFromTabAndWindow(tab, chromeWindow),
+        forced
+      );
+      allSucceeded = allSucceeded && succeeded;
     }
   }
+  return allSucceeded;
+}
+
+function scheduleRetry() {
+  if (retryTimerId !== null) {
+    return;
+  }
+
+  retryTimerId = setTimeout(() => {
+    retryTimerId = null;
+    schedulePush("retry");
+  }, retryDelayMs);
+  retryDelayMs = Math.min(retryDelayMs * 2, MAX_RETRY_DELAY_MS);
 }
 
 async function flushPendingPushes() {
@@ -148,12 +161,21 @@ async function flushPendingPushes() {
   try {
     while (pendingReason !== null) {
       const reasonToSend = pendingReason;
+      const forcedToSend = pendingForced;
       pendingReason = null;
+      pendingForced = false;
 
+      let succeeded = false;
       try {
-        await pushAllWindowSnapshots(reasonToSend);
+        succeeded = await pushAllWindowSnapshots(reasonToSend, forcedToSend);
       } catch (error) {
         console.warn("Failed to push Chrome window snapshots", error);
+      }
+
+      if (succeeded) {
+        retryDelayMs = INITIAL_RETRY_DELAY_MS;
+      } else {
+        scheduleRetry();
       }
     }
   } finally {
@@ -163,11 +185,29 @@ async function flushPendingPushes() {
 
 function schedulePush(reason) {
   pendingReason = reason;
+  if (FORCED_PUSH_REASONS.has(reason)) {
+    pendingForced = true;
+  }
   void flushPendingPushes();
 }
 
-chrome.tabs.onActivated.addListener(({ windowId }) => {
-  schedulePush("tab-activated", windowId);
+async function ensureHeartbeatAlarm() {
+  const existing = await chrome.alarms.get(HEARTBEAT_ALARM);
+  if (!existing) {
+    chrome.alarms.create(HEARTBEAT_ALARM, {
+      periodInMinutes: HEARTBEAT_PERIOD_MINUTES
+    });
+  }
+}
+
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === HEARTBEAT_ALARM) {
+    schedulePush("heartbeat");
+  }
+});
+
+chrome.tabs.onActivated.addListener(() => {
+  schedulePush("tab-activated");
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
@@ -176,17 +216,17 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   }
 
   if (changeInfo.status || changeInfo.title || changeInfo.url || changeInfo.favIconUrl) {
-    schedulePush("tab-updated", tab.windowId);
+    schedulePush("tab-updated");
   }
 });
 
 chrome.windows.onFocusChanged.addListener((windowId) => {
   if (windowId === chrome.windows.WINDOW_ID_NONE) {
-    schedulePush("window-focus-cleared", null);
+    schedulePush("window-focus-cleared");
     return;
   }
 
-  schedulePush("window-focus-changed", windowId);
+  schedulePush("window-focus-changed");
 });
 
 chrome.runtime.onInstalled.addListener(() => {
@@ -197,11 +237,15 @@ chrome.runtime.onStartup.addListener(() => {
   schedulePush("runtime-startup");
 });
 
+void ensureHeartbeatAlarm();
+
 globalThis.chromeFaviconBridgeDebug = {
-  pushAll: (reason = "manual-debug") => pushAllWindowSnapshots(reason),
+  pushAll: (reason = "manual-debug") => pushAllWindowSnapshots(reason, true),
   state: () => ({
     flushInFlight,
     pendingReason,
+    pendingForced,
+    retryDelayMs,
     lastPayloadFingerprints: Object.fromEntries(lastPayloadFingerprints)
   })
 };

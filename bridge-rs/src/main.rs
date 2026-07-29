@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::net::SocketAddr;
@@ -16,8 +16,8 @@ use clap::Parser;
 use serde_json::{json, Map, Value};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::UnixStream;
-use tokio::sync::{mpsc, RwLock};
-use tokio::time::sleep;
+use tokio::sync::{mpsc, oneshot, RwLock};
+use tokio::time::{sleep, timeout};
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{debug, error, info};
 use zbus::{interface, Connection, SignalContext};
@@ -50,8 +50,19 @@ struct Args {
 
 #[derive(Clone)]
 struct AppState {
-    tx: mpsc::Sender<Value>,
+    tx: mpsc::Sender<UpdateRequest>,
     token: Option<String>,
+}
+
+struct UpdateRequest {
+    payload: Value,
+    respond: oneshot::Sender<UpdateOutcome>,
+}
+
+#[derive(Clone, Copy)]
+struct UpdateOutcome {
+    mapped: bool,
+    hyprland: bool,
 }
 
 #[derive(Clone)]
@@ -232,17 +243,37 @@ async fn handle_update(
         );
     }
 
-    match state.tx.send(payload).await {
-        Ok(_) => (StatusCode::ACCEPTED, Json(json!({ "ok": true }))),
-        Err(_) => (
+    let (respond, outcome) = oneshot::channel();
+    if state
+        .tx
+        .send(UpdateRequest { payload, respond })
+        .await
+        .is_err()
+    {
+        return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({ "error": "bridge unavailable" })),
+        );
+    }
+
+    // Reply only after the payload has been enriched and published, so the
+    // extension can tell whether the window actually got mapped. The timeout
+    // must stay below the extension's fetch timeout.
+    match timeout(Duration::from_millis(1500), outcome).await {
+        Ok(Ok(outcome)) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "mapped": outcome.mapped,
+                "hyprland": outcome.hyprland
+            })),
         ),
+        _ => (StatusCode::ACCEPTED, Json(json!({ "ok": true }))),
     }
 }
 
 async fn process_payloads(
-    mut rx: mpsc::Receiver<Value>,
+    mut rx: mpsc::Receiver<UpdateRequest>,
     shared: SharedDbusState,
     connection: Connection,
     object_path: String,
@@ -253,8 +284,8 @@ async fn process_payloads(
         hyprland,
     };
 
-    while let Some(payload) = rx.recv().await {
-        let enriched = enricher.enrich(payload).await;
+    while let Some(request) = rx.recv().await {
+        let enriched = enricher.enrich(request.payload).await;
         let payload_text = match serde_json::to_string(&enriched) {
             Ok(v) => v,
             Err(err) => {
@@ -273,10 +304,27 @@ async fn process_payloads(
             .and_then(Value::as_str)
             .map(str::to_owned);
 
-        if let Some(window_id) = mapped_window_id.as_deref() {
+        {
+            let mapped_addresses = enricher
+                .window_map
+                .values()
+                .map(|mapping| mapping.address.clone())
+                .collect::<HashSet<_>>();
             let mut guard = shared.window_payloads.write().await;
-            guard.insert(window_id.to_owned(), enriched.clone());
+            guard.retain(|address, _| mapped_addresses.contains(address));
+            if let Some(window_id) = mapped_window_id.as_deref() {
+                guard.insert(window_id.to_owned(), enriched.clone());
+            }
         }
+
+        let hyprland_available = enriched
+            .pointer("/wm/available_backends")
+            .and_then(Value::as_array)
+            .is_some_and(|backends| {
+                backends
+                    .iter()
+                    .any(|backend| backend.as_str() == Some("hyprland"))
+            });
 
         let ctxt = match SignalContext::new(&connection, object_path.as_str()) {
             Ok(v) => v,
@@ -297,6 +345,11 @@ async fn process_payloads(
         if let Err(err) = ChromeWindowInfoInterface::updated(&ctxt, &payload_text).await {
             error!("failed to emit Updated signal: {err}");
         }
+
+        let _ = request.respond.send(UpdateOutcome {
+            mapped: mapped_window_id.is_some(),
+            hyprland: hyprland_available,
+        });
     }
 }
 
@@ -513,9 +566,11 @@ async fn apply_hyprland_event(shared: &SharedHyprlandState, line: &str) {
 
     match event_name {
         "activewindowv2" => {
-            if !event_payload.is_empty() {
-                guard.active_address = Some(normalize_hypr_address(event_payload));
-            }
+            guard.active_address = if event_payload.is_empty() {
+                None
+            } else {
+                Some(normalize_hypr_address(event_payload))
+            };
         }
         "windowtitlev2" => {
             let mut values = event_payload.splitn(2, ',');
@@ -713,6 +768,12 @@ fn score_hyprland_candidates(
         b.confidence
             .partial_cmp(&a.confidence)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                let a_focus = a.client.focus_history_id.unwrap_or(i64::MAX);
+                let b_focus = b.client.focus_history_id.unwrap_or(i64::MAX);
+                a_focus.cmp(&b_focus)
+            })
+            .then_with(|| a.client.address.cmp(&b.client.address))
     });
     scores
 }
@@ -723,27 +784,47 @@ fn update_mapping_from_candidates(
     window_map: &mut HashMap<String, WindowMapping>,
 ) -> Option<Value> {
     let chrome_window_id = chrome_window_id?;
-    let best = candidate_scores.first()?;
-    let threshold = if window_map
-        .get(chrome_window_id)
-        .is_some_and(|mapping| mapping.address == best.client.address)
-    {
-        0.25
-    } else {
-        0.45
-    };
 
-    if best.confidence < threshold {
-        return None;
+    for candidate in candidate_scores {
+        let threshold = if window_map
+            .get(chrome_window_id)
+            .is_some_and(|mapping| mapping.address == candidate.client.address)
+        {
+            0.25
+        } else {
+            0.45
+        };
+
+        if candidate.confidence < threshold {
+            continue;
+        }
+
+        // Mappings must stay one-to-one: an address already claimed by another
+        // Chrome window can only be taken from a lower-confidence claim.
+        let rival = window_map
+            .iter()
+            .find(|(id, mapping)| {
+                id.as_str() != chrome_window_id && mapping.address == candidate.client.address
+            })
+            .map(|(id, mapping)| (id.clone(), mapping.confidence));
+
+        if let Some((rival_id, rival_confidence)) = rival {
+            if rival_confidence >= candidate.confidence {
+                continue;
+            }
+            window_map.remove(&rival_id);
+        }
+
+        let mapping = WindowMapping {
+            address: candidate.client.address.clone(),
+            confidence: candidate.confidence,
+            sources: candidate.sources.clone(),
+        };
+        window_map.insert(chrome_window_id.to_owned(), mapping.clone());
+        return Some(mapping_json(&mapping));
     }
 
-    let mapping = WindowMapping {
-        address: best.client.address.clone(),
-        confidence: best.confidence,
-        sources: best.sources.clone(),
-    };
-    window_map.insert(chrome_window_id.to_owned(), mapping.clone());
-    Some(mapping_json(&mapping))
+    None
 }
 
 fn cached_mapping_json(
@@ -938,7 +1019,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = Args::parse();
 
-    let (tx, rx) = mpsc::channel::<Value>(128);
+    let (tx, rx) = mpsc::channel::<UpdateRequest>(128);
     let app_state = AppState {
         tx,
         token: args.token.clone(),

@@ -105,9 +105,11 @@ Each `Updated` signal carries one JSON string payload.
 - Interface: `org.imalison.ChromeWindowInfo`
 - Methods:
   - `GetLastPayload() -> s`
+  - `GetWindowPayloads() -> s` (JSON object keyed by Hyprland window address)
   - `GetSchema() -> s`
-- Signal:
+- Signals:
   - `Updated(s payload_json)`
+  - `WindowUpdated(s window_id, s payload_json)` (only for payloads with a Hyprland mapping)
 
 ## Correlation hints for consumers
 
@@ -137,5 +139,8 @@ The provided unit uses `%h/.nix-profile/bin/chrome-favicon-dbus`. If you install
 
 ## Notes
 
-- If daemon is not running, extension fails silently.
+- The daemon replies `{"ok": true, "mapped": <bool>, "hyprland": <bool>}` after the payload has been enriched and published. The extension only treats a snapshot as delivered when it was mapped (or no Hyprland backend exists), so unmapped windows are retried automatically.
+- The extension re-pushes all windows every 30 seconds (`chrome.alarms` heartbeat) and retries failed sends with exponential backoff, so daemon restarts and dropped updates self-heal.
+- Normal, popup, and app (PWA) windows are all published.
+- If daemon is not running, extension retries with backoff and otherwise fails silently.
 - Optional request auth is available with daemon `--token <value>` and extension support for `X-Bridge-Token`.
