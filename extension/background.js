@@ -191,21 +191,6 @@ function schedulePush(reason) {
   void flushPendingPushes();
 }
 
-async function ensureHeartbeatAlarm() {
-  const existing = await chrome.alarms.get(HEARTBEAT_ALARM);
-  if (!existing) {
-    chrome.alarms.create(HEARTBEAT_ALARM, {
-      periodInMinutes: HEARTBEAT_PERIOD_MINUTES
-    });
-  }
-}
-
-chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === HEARTBEAT_ALARM) {
-    schedulePush("heartbeat");
-  }
-});
-
 chrome.tabs.onActivated.addListener(() => {
   schedulePush("tab-activated");
 });
@@ -237,10 +222,47 @@ chrome.runtime.onStartup.addListener(() => {
   schedulePush("runtime-startup");
 });
 
-void ensureHeartbeatAlarm();
+// Registered last, and defensively: if the "alarms" permission is missing (an
+// older install whose grant predates it, for instance) touching chrome.alarms
+// throws, and a throw here must not cost us the listeners registered above.
+function setUpHeartbeat() {
+  if (!chrome.alarms) {
+    console.warn(
+      "chrome.alarms unavailable; heartbeat disabled. Reload the extension so the alarms permission is granted."
+    );
+    return;
+  }
+
+  chrome.alarms.onAlarm.addListener((alarm) => {
+    if (alarm.name === HEARTBEAT_ALARM) {
+      schedulePush("heartbeat");
+    }
+  });
+
+  chrome.alarms
+    .get(HEARTBEAT_ALARM)
+    .then((existing) => {
+      if (!existing) {
+        chrome.alarms.create(HEARTBEAT_ALARM, {
+          delayInMinutes: HEARTBEAT_PERIOD_MINUTES,
+          periodInMinutes: HEARTBEAT_PERIOD_MINUTES
+        });
+      }
+    })
+    .catch((error) => {
+      console.warn("Failed to schedule bridge heartbeat", error);
+    });
+}
+
+try {
+  setUpHeartbeat();
+} catch (error) {
+  console.warn("Heartbeat setup failed; continuing without it", error);
+}
 
 globalThis.chromeFaviconBridgeDebug = {
   pushAll: (reason = "manual-debug") => pushAllWindowSnapshots(reason, true),
+  heartbeatAlarm: () => (chrome.alarms ? chrome.alarms.get(HEARTBEAT_ALARM) : null),
   state: () => ({
     flushInFlight,
     pendingReason,
